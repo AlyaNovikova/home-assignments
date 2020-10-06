@@ -16,7 +16,7 @@ import numpy as np
 import pims
 
 from _corners import FrameCorners, CornerStorage, StorageImpl
-from _corners import dump, load, draw, without_short_tracks, create_cli
+from _corners import dump, load, draw, without_short_tracks, create_cli, filter_frame_corners
 
 
 class _CornerStorageBuilder:
@@ -35,12 +35,12 @@ class _CornerStorageBuilder:
 
 
 class Tracker:
-    MAX_CORNERS = 1000
-    QUALITY_LEVEL = 0.03
+    MAX_CORNERS = 0
+    QUALITY_LEVEL = 0.01
     MIN_DISTANCE = 10
     BLOCK_SIZE = 3
     CORNER_SIZES = 10
-    LEVELS_IN_PYRAMID = 3
+    LEVELS_IN_PYRAMID = 5
     WIN_SIZE = (15, 15)
 
     def corners_on_one_level(self, img, level):
@@ -59,37 +59,63 @@ class Tracker:
     def scale_corners(self, corners, sizes, level):
         return corners * 2 ** level, sizes * 2 ** level
 
-    # Add a new corner only if there are no old corners inside
-    def addCorners(self, corners1, size1, corners2, size2):
-        if len(corners2) == 0:
-            return corners1, size1
-        if len(corners1) == 0:
-            return corners2, size2
+    def addCorners(self, img_h, img_w, corners1, sizes1, ids1, corners2, sizes2, ids2):
+        mask = np.zeros((img_h, img_w))
 
-        diffs = corners2[:, None, :] - corners1[None, :, :]
-        dists = np.linalg.norm(diffs, axis=-1)
-        min_dists = np.min(dists, 1)
-        filter = min_dists < size2
+        for corner, size in zip(corners1, sizes1):
+            mask = cv2.circle(mask, (int(corner[0]), int(corner[1])), int(size), color=1, thickness=-1)
 
-        corners2, size2 = corners2[~filter], size2[~filter]
+        inds = []
+        for i, corner in enumerate(corners2):
+            coord = (int(corner[1]), int(corner[0]))
+            if not (0 <= coord[0] < img_h and 0 <= coord[1] < img_w):
+                continue
+            if mask[coord] == 0:
+                inds.append(i)
 
-        return np.concatenate([corners1, corners2], 0), np.concatenate([size1, size2], 0)
+        corners2 = corners2[inds]
+        sizes2 = sizes2[inds]
+        ids2 = ids2[inds]
 
-    def find_corners(self, img):
+        return np.concatenate([corners1, corners2], 0), \
+               np.concatenate([sizes1, sizes2], 0), \
+               np.concatenate([ids1, ids2], 0)
+
+    def filterCorners(self, corners, img_h, img_w):
+        mask = np.zeros((img_h, img_w))
+
+        inds = []
+        for i, (_, corner, size) in enumerate(zip(corners.ids, corners.points, corners.sizes)):
+            coord = (int(corner[1]), int(corner[0]))
+            if not (0 <= coord[0] < img_h and 0 <= coord[1] < img_w):
+                continue
+            if mask[coord] == 0:
+                mask = cv2.circle(mask, coord[::-1], int(size * 0.5), color=1, thickness=-1)
+                inds.append(i)
+
+        return filter_frame_corners(corners, np.array(inds))
+
+    def find_corners(self, img, last_id):
         corners = np.zeros((0, 2))
         sizes = np.zeros(0, dtype=np.int0)
+        ids = np.zeros(0, dtype=np.int0)
 
         for level in range(self.LEVELS_IN_PYRAMID):
             new_corners, new_sizes = self.corners_on_one_level(img, level)
             new_corners, new_sizes = self.scale_corners(new_corners, new_sizes, level)
+            new_ids = np.arange(len(new_corners)) + last_id + 1
 
-            corners, sizes = self.addCorners(corners, sizes, new_corners, new_sizes)
+            last_id += len(new_corners)
+
+            corners, sizes, ids = self.addCorners(img.shape[0], img.shape[1],
+                                                  corners, sizes, ids,
+                                                  new_corners, new_sizes, new_ids)
 
             img = cv2.pyrDown(img)
 
-        return corners, sizes
+        return corners, sizes, ids
 
-    def tracking(self, img1, img2, corners, sizes):
+    def tracking(self, img1, img2, corners, sizes, ids):
         corners = np.float32(corners)
         new_corners = np.zeros_like(corners)
 
@@ -101,17 +127,14 @@ class Tracker:
                                                             corners,
                                                             new_corners,
                                                             winSize=self.WIN_SIZE,
-                                                            maxLevel=self.LEVELS_IN_PYRAMID,
-                                                            criteria=(
-                                                                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10,
-                                                                0.03),
-                                                            minEigThreshold=0.001
+                                                            maxLevel=self.LEVELS_IN_PYRAMID
                                                             )
 
         filter = np.squeeze(status.astype(np.bool), 1)
         new_corners = new_corners[filter]
         new_sizes = sizes[filter]
-        return new_corners, new_sizes
+        new_ids = ids[filter]
+        return new_corners, new_sizes, new_ids
 
 
 def _build_impl(frame_sequence: pims.FramesSequence,
@@ -121,13 +144,20 @@ def _build_impl(frame_sequence: pims.FramesSequence,
 
     for frame, img_curr in enumerate(frame_sequence):
         if img_prev is None:
-            coords, sizes = tracker.find_corners(img_curr)
+            coords, sizes, ids = tracker.find_corners(img_curr, 0)
         if img_prev is not None:
-            coords, sizes = tracker.tracking(img_prev, img_curr, coords, sizes)
-            new_coords, new_sizes = tracker.find_corners(img_curr)
-            coords, sizes = tracker.addCorners(coords, sizes, new_coords, new_sizes)
+            coords, sizes, ids = tracker.tracking(img_prev, img_curr,
+                                                  corners.points,
+                                                  corners.sizes[:, 0],
+                                                  corners.ids[:, 0])
+            new_coords, new_sizes, new_ids = tracker.find_corners(img_curr, ids.max())
 
-        corners = FrameCorners(np.arange(len(coords)), coords, sizes)
+            coords, sizes, ids = tracker.addCorners(img_curr.shape[0], img_curr.shape[1],
+                                                    coords, sizes, ids,
+                                                    new_coords, new_sizes, new_ids)
+
+        corners = FrameCorners(ids, coords, sizes)
+        corners = tracker.filterCorners(corners, img_curr.shape[0], img_curr.shape[1])
 
         builder.set_corners_at_frame(frame, corners)
         img_prev = img_curr
