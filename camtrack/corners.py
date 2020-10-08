@@ -141,16 +141,19 @@ def _build_impl(frame_sequence: pims.FramesSequence,
                 builder: _CornerStorageBuilder) -> None:
     tracker = Tracker()
     img_prev = None
+    last_id = 0
 
     for frame, img_curr in enumerate(frame_sequence):
         if img_prev is None:
             coords, sizes, ids = tracker.find_corners(img_curr, 0)
+            last_id += len(coords)
         if img_prev is not None:
             coords, sizes, ids = tracker.tracking(img_prev, img_curr,
                                                   corners.points,
                                                   corners.sizes[:, 0],
                                                   corners.ids[:, 0])
-            new_coords, new_sizes, new_ids = tracker.find_corners(img_curr, ids.max())
+            new_coords, new_sizes, new_ids = tracker.find_corners(img_curr, last_id)
+            last_id += len(new_coords)
 
             coords, sizes, ids = tracker.addCorners(img_curr.shape[0], img_curr.shape[1],
                                                     coords, sizes, ids,
