@@ -34,7 +34,7 @@ class _CornerStorageBuilder:
         return StorageImpl(item[1] for item in sorted(self._corners.items()))
 
 
-class Tracker:
+class CornerTracker:
     MAX_CORNERS = 0
     QUALITY_LEVEL = 0.01
     MIN_DISTANCE = 10
@@ -139,7 +139,7 @@ class Tracker:
 
 def _build_impl(frame_sequence: pims.FramesSequence,
                 builder: _CornerStorageBuilder) -> None:
-    tracker = Tracker()
+    tracker = CornerTracker()
     img_prev = None
     last_id = 0
 
