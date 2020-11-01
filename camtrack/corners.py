@@ -36,7 +36,7 @@ class _CornerStorageBuilder:
 
 class CornerTracker:
     MAX_CORNERS = 0
-    QUALITY_LEVEL = 0.01
+    QUALITY_LEVEL = 0.001
     MIN_DISTANCE = 10
     BLOCK_SIZE = 3
     CORNER_SIZES = 10
