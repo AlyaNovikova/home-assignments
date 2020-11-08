@@ -35,10 +35,12 @@ class Tracker:
                                             min_triangulation_angle_deg=2.,
                                             min_depth=0.1)
 
+    CONFIDENCE = 0.999
     FRAMES_FOR_RETRIANGULATION = 10
-    RETRIANGULATION_FREQUENCY = 10
+    RETRIANGULATION_FREQUENCY = 29
     RETRIANGULATION_REPETITIONS = 10
-    MAX_RETRIANGULATION_ERROR = 0.5
+    MAX_RETRIANGULATION_ERROR = 0.4
+    MAX_FRAMES = 20
 
     def init(self, corner_storage, known_view_1, known_view_2, intrinsic_mat):
         frame_1, frame_2 = known_view_1[0], known_view_2[0]
@@ -64,10 +66,26 @@ class Tracker:
         points2d = corners.points[indices2d]
         points3d = point_cloud_builder.points[indices3d]
 
-        if len(points2d) >= 4:
-            return cv2.solvePnPRansac(points3d, points2d, intrinsic_mat, None)
-        else:
+        if len(points2d) < 4:
             return False, None, None, None
+
+        retval, rvec, tvec, inliers = cv2.solvePnPRansac(points3d, points2d,
+                                                         intrinsic_mat,
+                                                         distCoeffs=None,
+                                                         confidence=self.CONFIDENCE,
+                                                         flags=cv2.SOLVEPNP_EPNP)
+        if not retval:
+            return False, None, None, None
+
+        ids = np.array(inliers).flatten()
+        _, rvec, tvec = cv2.solvePnP(points3d[ids], points2d[ids],
+                                     intrinsic_mat,
+                                     distCoeffs=None,
+                                     rvec=rvec,tvec=tvec,
+                                     useExtrinsicGuess=True,
+                                     flags=cv2.SOLVEPNP_ITERATIVE)
+
+        return retval, rvec, tvec, inliers
 
     def update_corners(self, corners, ids):
         res = []
@@ -91,11 +109,9 @@ class Tracker:
             if len(points) != 0:
                 print(f'\t Triangulated {len(points)} points in {j} frame')
 
-            point_cloud_builder.add_points(ids, points)
+            point_cloud_builder.my_add_points(ids, points)
 
     def retriangulate(self, corner_storage, view_mats, point_cloud_builder, intrinsic_mat):
-        np.random.seed(1)
-
         frame_count = len(corner_storage)
         new_points, new_ids = [], []
         for point_id in point_cloud_builder.ids:
@@ -115,7 +131,11 @@ class Tracker:
             max_inliers = 0
             res_point = None
 
-            np.random.shuffle(frames)
+            frames, mats, corners = np.array(frames), np.array(mats), np.array(corners)
+            max_frames = min(self.MAX_FRAMES, len(frames))
+            inds = np.random.choice(len(frames), max_frames, replace=False)
+            frames, mats, corners = frames[inds], mats[inds], corners[inds]
+
             for _ in range(self.RETRIANGULATION_REPETITIONS):
                 i = np.random.choice(len(frames))
                 j = np.random.choice(len(frames))
@@ -136,7 +156,7 @@ class Tracker:
 
                 inliers = errors[errors < self.MAX_RETRIANGULATION_ERROR]
 
-                if (max_inliers < len(inliers)):
+                if max_inliers < len(inliers):
                     max_inliers = len(inliers)
                     res_point = point
 
@@ -146,7 +166,7 @@ class Tracker:
 
         if len(new_points) != 0:
             print(f'Retriangulated {len(new_points)} points')
-            point_cloud_builder.add_points(np.array(new_ids), np.array(new_points))
+            point_cloud_builder.my_update_points(np.array(new_ids), np.array(new_points))
 
     def track(self, corner_storage, view_mats, point_cloud_builder, intrinsic_mat):
         frame_count = len(corner_storage)
@@ -181,9 +201,9 @@ class Tracker:
                             intrinsic_mat)
                 print(f'\t Cloud contains {len(point_cloud_builder.points)} points')
 
-            if cnt % self.RETRIANGULATION_FREQUENCY == 0:
-                self.retriangulate(corner_storage, view_mats, point_cloud_builder, intrinsic_mat)
-            cnt += 1
+                if cnt % self.RETRIANGULATION_FREQUENCY == 0:
+                    self.retriangulate(corner_storage, view_mats, point_cloud_builder, intrinsic_mat)
+                cnt += 1
 
             if not was_updated:
                 break
@@ -203,6 +223,8 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         camera_parameters,
         rgb_sequence[0].shape[0]
     )
+
+    np.random.seed(1)
 
     tracker = Tracker()
     view_mats, point_cloud_builder = tracker.init(corner_storage, known_view_1, known_view_2, intrinsic_mat)
