@@ -32,7 +32,7 @@ from _camtrack import (
 class Tracker:
     TRIANGULATION_INIT_POSITIONS = TriangulationParameters(max_reprojection_error=1.,
                                             min_triangulation_angle_deg=3.,
-                                            min_depth=0.1)
+                                            min_depth=0.001)
     TRIANGULATION_INIT = TriangulationParameters(max_reprojection_error=2.,
                                                  min_triangulation_angle_deg=0.01,
                                                  min_depth=0.001)
@@ -222,7 +222,7 @@ class Tracker:
 
     def track(self, corner_storage, view_mats, point_cloud_builder, intrinsic_mat):
         frame_count = len(corner_storage)
-        cnt = 1
+        cnt = 0
         while True:
             was_updated = False
             for i in range(frame_count):
