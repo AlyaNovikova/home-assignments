@@ -24,23 +24,75 @@ from _camtrack import (
     build_correspondences,
     triangulate_correspondences,
     compute_reprojection_errors,
-    rodrigues_and_translation_to_view_mat3x4
+    rodrigues_and_translation_to_view_mat3x4,
+    _remove_correspondences_with_ids,
+    eye3x4
 )
 
 class Tracker:
+    TRIANGULATION_INIT_POSITIONS = TriangulationParameters(max_reprojection_error=1.,
+                                            min_triangulation_angle_deg=3.,
+                                            min_depth=0.1)
     TRIANGULATION_INIT = TriangulationParameters(max_reprojection_error=2.,
                                                  min_triangulation_angle_deg=0.01,
                                                  min_depth=0.001)
-    TRIANGULATION = TriangulationParameters(max_reprojection_error=1.,
-                                            min_triangulation_angle_deg=2.,
-                                            min_depth=0.1)
+    TRIANGULATION = TriangulationParameters(max_reprojection_error=0.2,
+                                            min_triangulation_angle_deg=3.,
+                                            min_depth=0.001)
 
     CONFIDENCE = 0.999
     FRAMES_FOR_RETRIANGULATION = 10
-    RETRIANGULATION_FREQUENCY = 29
+    RETRIANGULATION_FREQUENCY = 10
     RETRIANGULATION_REPETITIONS = 10
     MAX_RETRIANGULATION_ERROR = 0.4
     MAX_FRAMES = 20
+
+    def init_camera_positions(self, corner_storage, intrinsic_mat):
+        frame_count = len(corner_storage)
+
+        frames = [(0, i) for i in range(1, frame_count)]
+
+        max_points = 0
+        min_cos = 1
+        frame1_res = 0
+        frame2_res = 10
+        pose1 = eye3x4()
+        pose2 = None
+
+        idx_res = None
+        points_res = None
+
+        for frame1, frame2 in frames:
+            coors = build_correspondences(corner_storage[frame1], corner_storage[frame2])
+            if len(coors.points_1) == 0:
+                continue
+
+            points1, points2 = coors.points_1, coors.points_2
+            retval, mask = cv2.findEssentialMat(points1, points2, intrinsic_mat)
+
+            if retval is None:
+                continue
+            if mask is not None:
+                coors = _remove_correspondences_with_ids(coors, np.argwhere(mask.flatten() == 0))
+
+            R1, R2, t = cv2.decomposeEssentialMat(retval)
+            for R in [R1, R2]:
+                pose = np.hstack([R, t])
+                points, idx, median_cos = triangulate_correspondences(coors,
+                                                                      pose1, pose,
+                                                                      intrinsic_mat,
+                                                                      self.TRIANGULATION_INIT_POSITIONS)
+
+                if (len(points) == max_points and min_cos > median_cos) or max_points < len(points):
+                    max_points = len(points)
+                    min_cos = median_cos
+                    frame1_res = frame1
+                    frame2_res = frame2
+                    pose2 = pose
+                    idx_res = idx
+                    points_res = points
+
+        return points_res, idx_res, (frame1_res, view_mat3x4_to_pose(pose1)), (frame2_res, view_mat3x4_to_pose(pose2))
 
     def init(self, corner_storage, known_view_1, known_view_2, intrinsic_mat):
         frame_1, frame_2 = known_view_1[0], known_view_2[0]
@@ -98,7 +150,7 @@ class Tracker:
             if i == j or view_mats[j] is None:
                 continue
             coors = build_correspondences(corner_storage[j], corners)
-            if len(coors) == 0:
+            if len(coors.points_1) == 0:
                 continue
 
             points, ids, median_cos = triangulate_correspondences(coors,
@@ -170,7 +222,7 @@ class Tracker:
 
     def track(self, corner_storage, view_mats, point_cloud_builder, intrinsic_mat):
         frame_count = len(corner_storage)
-        cnt = 0
+        cnt = 1
         while True:
             was_updated = False
             for i in range(frame_count):
@@ -201,9 +253,9 @@ class Tracker:
                             intrinsic_mat)
                 print(f'\t Cloud contains {len(point_cloud_builder.points)} points')
 
-                if cnt % self.RETRIANGULATION_FREQUENCY == 0:
-                    self.retriangulate(corner_storage, view_mats, point_cloud_builder, intrinsic_mat)
-                cnt += 1
+            if cnt % self.RETRIANGULATION_FREQUENCY == 0:
+                self.retriangulate(corner_storage, view_mats, point_cloud_builder, intrinsic_mat)
+            cnt += 1
 
             if not was_updated:
                 break
@@ -215,8 +267,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                           known_view_1: Optional[Tuple[int, Pose]] = None,
                           known_view_2: Optional[Tuple[int, Pose]] = None) \
         -> Tuple[List[Pose], PointCloud]:
-    if known_view_1 is None or known_view_2 is None:
-        raise NotImplementedError()
 
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
@@ -227,7 +277,21 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
     np.random.seed(1)
 
     tracker = Tracker()
-    view_mats, point_cloud_builder = tracker.init(corner_storage, known_view_1, known_view_2, intrinsic_mat)
+
+    if known_view_1 is None or known_view_2 is None:
+        points, idx, known_view_1, known_view_2 = tracker.init_camera_positions(corner_storage, intrinsic_mat)
+
+        view_mats = [None] * len(corner_storage)
+        frame_1, frame_2 = known_view_1[0], known_view_2[0]
+        view_mat_1, view_mat_2 = pose_to_view_mat3x4(known_view_1[1]), pose_to_view_mat3x4(known_view_2[1])
+        view_mats[frame_1], view_mats[frame_2] = view_mat_1, view_mat_2
+
+        point_cloud_builder = PointCloudBuilder(idx, points)
+
+        print(f'initialized with frames {frame_1} and {frame_2} with {len(points)} points')
+    else:
+        view_mats, point_cloud_builder = tracker.init(corner_storage, known_view_1, known_view_2, intrinsic_mat)
+
     tracker.track(corner_storage, view_mats, point_cloud_builder, intrinsic_mat)
     print(f'Cloud contains {len(point_cloud_builder.points)} points')
 
