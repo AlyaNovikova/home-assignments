@@ -6,6 +6,7 @@ __all__ = [
 
 from typing import List, Optional, Tuple
 
+from scipy.optimize import least_squares
 import numpy as np
 import cv2
 
@@ -26,18 +27,20 @@ from _camtrack import (
     compute_reprojection_errors,
     rodrigues_and_translation_to_view_mat3x4,
     _remove_correspondences_with_ids,
+    project_points,
     eye3x4
 )
 
+
 class Tracker:
-    TRIANGULATION_INIT_POSITIONS = TriangulationParameters(max_reprojection_error=1.,
-                                            min_triangulation_angle_deg=3.,
-                                            min_depth=0.001)
+    TRIANGULATION_INIT_POSITIONS = TriangulationParameters(max_reprojection_error=4.,
+                                                           min_triangulation_angle_deg=2.,
+                                                           min_depth=0.001)
     TRIANGULATION_INIT = TriangulationParameters(max_reprojection_error=2.,
                                                  min_triangulation_angle_deg=0.01,
                                                  min_depth=0.001)
-    TRIANGULATION = TriangulationParameters(max_reprojection_error=0.2,
-                                            min_triangulation_angle_deg=3.,
+    TRIANGULATION = TriangulationParameters(max_reprojection_error=1.,
+                                            min_triangulation_angle_deg=2.,
                                             min_depth=0.001)
 
     CONFIDENCE = 0.999
@@ -46,21 +49,38 @@ class Tracker:
     RETRIANGULATION_REPETITIONS = 10
     MAX_RETRIANGULATION_ERROR = 0.4
     MAX_FRAMES = 20
+    MAX_FRAME_PAIRS = 1000
+    MAX_HOMOGRAPHY = 0.2
+
+    class PairOfFrames:
+        def __init__(self, points, idx, frame1, frame2, pose, median_cos, good_frames, homography):
+            self.points = points
+            self.idx = idx
+            self.frame1 = frame1
+            self.frame2 = frame2
+            self.pose = pose
+            self.median_cos = median_cos
+            self.good_frames = good_frames
+            self.homography = homography
 
     def init_camera_positions(self, corner_storage, intrinsic_mat):
         frame_count = len(corner_storage)
 
+        near = 10
+        far = near + 30
         frames = [(0, i) for i in range(1, frame_count)]
+        frames += [(j, i) for i in range(1, frame_count) for j in range(max(0, i - far), max(0, i - near) + 1)]
 
-        max_points = 0
-        min_cos = 1
-        frame1_res = 0
-        frame2_res = 10
+        np.random.shuffle(frames)
+
+        if len(frames) > self.MAX_FRAME_PAIRS:
+            frames = frames[:self.MAX_FRAME_PAIRS]
+
         pose1 = eye3x4()
-        pose2 = None
 
-        idx_res = None
-        points_res = None
+        pairs = []
+        good_pairs = []
+        all_points = 0
 
         for frame1, frame2 in frames:
             coors = build_correspondences(corner_storage[frame1], corner_storage[frame2])
@@ -70,29 +90,60 @@ class Tracker:
             points1, points2 = coors.points_1, coors.points_2
             retval, mask = cv2.findEssentialMat(points1, points2, intrinsic_mat)
 
-            if retval is None:
+            if retval is None or mask is None:
                 continue
-            if mask is not None:
-                coors = _remove_correspondences_with_ids(coors, np.argwhere(mask.flatten() == 0))
+
+            coors = _remove_correspondences_with_ids(coors, np.argwhere(mask.flatten() == 0))
+            points1, points2 = coors.points_1, coors.points_2
+
+            _, mask_homography = cv2.findHomography(points1, points2,
+                                                    method=cv2.RANSAC)
+
+            if mask_homography is None:
+                continue
+
+            inliers = np.count_nonzero(mask)
+            inliers_homography = np.count_nonzero(mask_homography)
+
+            good_frames = True
+            homography = inliers_homography / inliers
+            if homography > self.MAX_HOMOGRAPHY:
+                good_frames = False
 
             R1, R2, t = cv2.decomposeEssentialMat(retval)
             for R in [R1, R2]:
-                pose = np.hstack([R, t])
-                points, idx, median_cos = triangulate_correspondences(coors,
-                                                                      pose1, pose,
-                                                                      intrinsic_mat,
-                                                                      self.TRIANGULATION_INIT_POSITIONS)
+                for t1 in [-t, t]:
+                    pose = np.hstack([R, t1])
+                    points, idx, median_cos = triangulate_correspondences(coors,
+                                                                          pose1, pose,
+                                                                          intrinsic_mat,
+                                                                          self.TRIANGULATION_INIT_POSITIONS)
 
-                if (len(points) == max_points and min_cos > median_cos) or max_points < len(points):
-                    max_points = len(points)
-                    min_cos = median_cos
-                    frame1_res = frame1
-                    frame2_res = frame2
-                    pose2 = pose
-                    idx_res = idx
-                    points_res = points
+                    if len(points) == 0:
+                        continue
 
-        return points_res, idx_res, (frame1_res, view_mat3x4_to_pose(pose1)), (frame2_res, view_mat3x4_to_pose(pose2))
+                    pair = self.PairOfFrames(points, idx, frame1, frame2, pose, median_cos, good_frames, homography)
+                    pairs.append(pair)
+                    all_points = max(all_points, len(points))
+
+                    if good_frames:
+                        good_pairs.append(pair)
+
+        def sort_key(frame_pair):
+            return -(0.3 * (1 - frame_pair.homography) + 0.7 * len(frame_pair.points) / all_points)
+
+        def best_frames(frame_pairs):
+            sorted_pairs = sorted(frame_pairs, key=lambda x: sort_key(x))
+            
+            best = sorted_pairs[0]
+            return (best.points, best.idx,
+                    (best.frame1, view_mat3x4_to_pose(pose1)),
+                    (best.frame2, view_mat3x4_to_pose(best.pose)))
+
+        if len(good_pairs) != 0:
+            return best_frames(good_pairs)
+
+        return best_frames(pairs)
 
     def init(self, corner_storage, known_view_1, known_view_2, intrinsic_mat):
         frame_1, frame_2 = known_view_1[0], known_view_2[0]
@@ -130,12 +181,41 @@ class Tracker:
             return False, None, None, None
 
         ids = np.array(inliers).flatten()
-        _, rvec, tvec = cv2.solvePnP(points3d[ids], points2d[ids],
-                                     intrinsic_mat,
-                                     distCoeffs=None,
-                                     rvec=rvec,tvec=tvec,
-                                     useExtrinsicGuess=True,
-                                     flags=cv2.SOLVEPNP_ITERATIVE)
+
+        # PnP c M-оценками
+        def vec6_to_mat4x4(vec6):
+            rvec = vec6[:3]
+            tvec = vec6[3:]
+            mat = np.eye(4)[:3]
+            mat[:3, :3] = cv2.Rodrigues(rvec)[0]
+            mat[:3, 3] = tvec
+            return mat
+
+        def calc_residuals(vec6):
+            view = vec6_to_mat4x4(vec6)
+            view_proj = intrinsic_mat @ view
+            projected = project_points(points3d, view_proj)
+            return (projected - points2d).flatten()
+
+        points3d, points2d = points3d[ids], points2d[ids]
+
+        vec6 = least_squares(
+            fun=calc_residuals,
+            x0=np.zeros(6, dtype=float),
+            loss='huber',
+            method='trf'
+        ).x
+
+        rvec = vec6[:3, np.newaxis]
+        tvec = vec6[3:, np.newaxis]
+
+        # без M-оценок
+        # _, rvec, tvec = cv2.solvePnP(points3d[ids], points2d[ids],
+        #                              intrinsic_mat,
+        #                              distCoeffs=None,
+        #                              rvec=rvec, tvec=tvec,
+        #                              useExtrinsicGuess=True,
+        #                              flags=cv2.SOLVEPNP_ITERATIVE)
 
         return retval, rvec, tvec, inliers
 
@@ -222,7 +302,7 @@ class Tracker:
 
     def track(self, corner_storage, view_mats, point_cloud_builder, intrinsic_mat):
         frame_count = len(corner_storage)
-        cnt = 0
+        cnt = 1
         while True:
             was_updated = False
             for i in range(frame_count):
@@ -267,7 +347,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                           known_view_1: Optional[Tuple[int, Pose]] = None,
                           known_view_2: Optional[Tuple[int, Pose]] = None) \
         -> Tuple[List[Pose], PointCloud]:
-
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
         camera_parameters,
